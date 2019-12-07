@@ -8,13 +8,22 @@ import contextlib
 
 
 class TFTPWriteAdapter:
-    def __init__(self, dgram_protocol):
+    # TFTP specifies 512 byte data messages
+    BLOCK_SIZE = 512
+
+    _UNSPECIFIED = object()
+
+    def __init__(self, dgram_protocol, retries=5, timeout=3.0):
         self.proto = dgram_protocol
         self.block_num = 1
+        self.last_block = bytes()
+        self.retries = retries
+        self.timeout = timeout
 
-    async def _do_write(self, buf, loop, retries, timeout):
+    async def _do_write(self, buf, retries, timeout):
         # Write the data
         # Wait for ack before returning to the caller
+        loop = asyncio.get_event_loop()
         for _ in range(retries):
             try:
                 fut = loop.create_future()
@@ -32,21 +41,39 @@ class TFTPWriteAdapter:
         # TODO: Better exception
         raise Exception("Timeout occurred")
 
-    async def write(self, buf, retries=5, timeout=3.0):
-        loop = asyncio.get_event_loop()
+    async def _write_block(self, buf, retries=_UNSPECIFIED, timeout=_UNSPECIFIED):
+        retries = self.retries if retries is self._UNSPECIFIED else retries
+        timeout = self.timeout if timeout is self._UNSPECIFIED else timeout
+        msg = messages.Data(self.block_num, buf)
+        raw_response = await self._do_write(msg.encode(), retries, timeout)
+        response = messages.decode(raw_response)
 
-        # TFTP specifies 512 byte data messages
-        for part in bytegroups(buf, 512):
-            msg = messages.Data(self.block_num, part)
-            raw_response = await self._do_write(msg.encode(), loop, retries, timeout)
-            response = messages.decode(raw_response)
+        return response
 
-            # TODO: errors here instead of the assert.
-            assert response.block_num == self.block_num
+    async def write(self, buf, retries=_UNSPECIFIED, timeout=_UNSPECIFIED):
+
+        for part in bytegroups(buf, self.BLOCK_SIZE):
+            while True:
+                res = await self._write_block(buf, retries, timeout)
+                if res.block_num == self.block_num - 1:
+                    # Received previous ack instead of the expected one.
+                    continue
+                elif res.block_num == self.block_num:
+                    # Received expected ack.
+                    break
+                else:
+                    # Received unexpected ack
+                    raise Exception("Invalid packet received")
 
             self.block_num += 1
+            self.last_block = buf
 
-    def close(self):
+    async def close(self, retries=_UNSPECIFIED, timeout=_UNSPECIFIED):
+        # If the last block sent was a full block, then send an empty one
+        # indicating file completion
+        if len(self.last_block) == self.BLOCK_SIZE:
+            await self.write(bytes(), retries, timeout)
+
         self.proto.close()
 
 
@@ -61,10 +88,11 @@ def bytegroups(iterable, size):
 
 
 class TFTPFileSenderProtocol(asyncio.DatagramProtocol):
-    def __init__(self, addr, port):
+    def __init__(self, addr, port, closer):
         self.addr = addr
         self.port = port
         self.receiver = None
+        self.closer = closer
 
     def connection_made(self, transport):
         self.transport = transport
@@ -102,11 +130,12 @@ class TFTPFileReceiverProtocol(asyncio.DatagramProtocol):
 
 async def create_write_connection(rrq, protocol, ip, port):
     loop = asyncio.get_event_loop()
+    closer = loop.create_future()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: TFTPFileSenderProtocol(ip, port), remote_addr=(ip, port)
+        lambda: TFTPFileSenderProtocol(ip, port, closer), remote_addr=(ip, port)
     )
     writer = TFTPWriteAdapter(protocol)
-    with contextlib.closing(writer):
+    async with contextlib.closing(writer):
         with open(rrq.filename, "rb") as fobj:
             await writer.write(fobj.read())
 
