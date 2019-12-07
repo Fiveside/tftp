@@ -64,6 +64,9 @@ class Data:
     block_num: int
     data: bytes
 
+    # This is the maximum size of a data packet's data buffer per packet.
+    max_data_size = 512 - 4
+
     @classmethod
     def decode(cls, pkt):
         (opcode, block_num) = struct.unpack("!hh", pkt[0:4])
