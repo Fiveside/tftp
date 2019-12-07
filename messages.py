@@ -65,7 +65,13 @@ class Data:
     data: bytes
 
     # This is the maximum size of a data packet's data buffer per packet.
-    max_data_size = 512 - 4
+    # Note that this number was aquired by looking at the data that the tftp
+    # linux utility sends us.
+    max_data_size = 512
+
+    @property
+    def is_full_block(self):
+        return len(self.data) == self.max_data_size
 
     @classmethod
     def decode(cls, pkt):

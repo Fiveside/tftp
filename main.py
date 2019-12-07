@@ -7,7 +7,7 @@ import itertools
 import contextlib
 
 
-class RPCProtocolAdapter:
+class TFTPStepwiseRetryAdapter:
     def __init__(self, dgram_protocol, retries=5, timeout=3.0):
         self.proto = dgram_protocol
         self.block_num = 1
@@ -41,7 +41,7 @@ class RPCProtocolAdapter:
         """Send a packet and do not wait for a response."""
         self.proto.transport.sendto(buf)
 
-    def close(self):
+    async def close(self):
         self.proto.close()
 
 
@@ -127,12 +127,15 @@ class TFTPDataReceiver:
         assert res.block_num == self.block_num + 1
         self.block_num = res.block_num
 
-        if not res.is_full_block():
+        print(f"Read {len(res.data)} bytes of data from client")
+
+        if not res.is_full_block:
             await self.finalize()
 
         return res.data
 
     async def finalize(self):
+        print("Read EOF detected, finalizing.")
         self.eof_reached = True
         msg = messages.Acknowledgement(self.block_num)
         self.proto.emit(msg.encode())
@@ -151,17 +154,10 @@ def bytegroups(iterable, size):
             return
 
 
-class AsyncMultiCloser:
-    def __init__(self, *things):
-        self.things = things
-
-    async def __aenter__(self):
-        if len(self.things) == 1:
-            return self.things[0]
-        return self.things
-
-    async def __aexit__(self, *exc_info):
-        await asyncio.gather(*(x.close() for x in self.things))
+@contextlib.asynccontextmanager
+async def aclosing(thing):
+    yield thing
+    await thing.close()
 
 
 class TFTPTransferProtocol(asyncio.DatagramProtocol):
@@ -199,11 +195,8 @@ class TFTPTransferProtocol(asyncio.DatagramProtocol):
         self.receiver = fut
 
     def close(self):
-        self.closer.set_result(None)
-
-
-class TFTPFileReceiverProtocol(asyncio.DatagramProtocol):
-    pass
+        if not self.closer.done():
+            self.closer.set_result(None)
 
 
 async def send_file_to_client(rrq, ip, port):
@@ -212,12 +205,12 @@ async def send_file_to_client(rrq, ip, port):
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: TFTPTransferProtocol(ip, port, closer), remote_addr=(ip, port)
     )
-    async with AsyncMultiCloser(transport, protocol):
-        sender = TFTPBufferedDataSender(RPCProtocolAdapter(protocol))
-        async with AsyncMultiCloser(sender):
+    with contextlib.closing(transport), contextlib.closing(protocol):
+        sender = TFTPBufferedDataSender(TFTPStepwiseRetryAdapter(protocol))
+        async with aclosing(sender):
             with open(rrq.filename, "rb") as fobj:
                 for buf in fobj:
-                    sender.send(buf)
+                    await sender.send(buf)
 
     # Make sure protocol disposition was graceful
     await closer
@@ -230,11 +223,14 @@ async def read_file_from_client(wrq, ip, port):
         lambda: TFTPTransferProtocol(ip, port, closer), remote_addr=(ip, port)
     )
     with contextlib.closing(transport), contextlib.closing(protocol):
-        reader = TFTPDataReceiver(RPCProtocolAdapter(protocol))
-        async with AsyncMultiCloser(reader):
-            with open(wrq.filename, "rb") as fobj:
+        reader = TFTPDataReceiver(TFTPStepwiseRetryAdapter(protocol))
+        async with aclosing(reader):
+            with open(wrq.filename, "wb") as fobj:
                 async for buf in reader:
                     fobj.write(buf)
+
+    # Make sure protocol disposition was graceful
+    await closer
 
 
 class TFTPServerProtocol(asyncio.DatagramProtocol):
@@ -245,8 +241,11 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
     async def periodically_prune_jobs(self):
         with contextlib.suppress(asyncio.CancelledError):
             while True:
-                self.jobs = [x for x in self.jobs if not x.done()]
+                self.jobs = self.running_jobs()
                 await asyncio.sleep(5)
+
+    def running_jobs(self):
+        return [x for x in self.jobs if not x.done()]
 
     def connection_made(self, transport):
         self.transport = transport
@@ -263,8 +262,7 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             print(f"Message not appropriate for server port")
             return
 
-        self.jobs.append(job)
-        asyncio.ensure_future(job)
+        self.jobs.append(asyncio.ensure_future(job))
 
     def connection_lost(self, exc):
         if exc is None:
@@ -276,7 +274,7 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
 
     async def close(self):
         self.job_task.cancel()
-        await asyncio.gather(*self.jobs)
+        await asyncio.gather(*self.running_jobs())
 
 
 async def main():
@@ -287,15 +285,14 @@ async def main():
         TFTPServerProtocol, local_addr=("127.0.0.1", 9999)
     )
 
-    finisher = loop.create_future()
+    signal_finisher = loop.create_future()
 
     for sig in [signal.SIGTERM, signal.SIGINT]:
-        loop.add_signal_handler(sig, lambda: finisher.set_result(None))
+        loop.add_signal_handler(sig, lambda: signal_finisher.set_result(None))
 
-    try:
-        await finisher
-    finally:
-        transport.close()
+    await signal_finisher
+    transport.close()
+    await protocol.close()
 
 
 asyncio.run(main())
