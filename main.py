@@ -3,15 +3,12 @@
 import asyncio
 import signal
 import messages
-import itertools
 import contextlib
 
 
 class TFTPStepwiseRetryAdapter:
     def __init__(self, dgram_protocol, retries=5, timeout=3.0):
         self.proto = dgram_protocol
-        self.block_num = 1
-        self.last_block = bytes()
         self.retries = retries
         self.timeout = timeout
 
@@ -45,37 +42,17 @@ class TFTPStepwiseRetryAdapter:
         self.proto.close()
 
 
-class FIFOBuffer:
-    def __init__(self):
-        self._buf = bytes()
-
-    def __len__(self):
-        return len(self._buf)
-
-    def write(self, buf):
-        self._buf += buf
-
-    def read(self, count):
-        res = self._buf[0:count]
-        self._buf = self._buf[count:]
-        return res
-
-    def readall(self):
-        buf = self._buf
-        self._buf = bytes()
-        return buf
-
-
 class TFTPBufferedDataSender:
     def __init__(self, sender):
         self.proto = sender
         self.block_num = 1
-        self.send_buffer = FIFOBuffer()
+        self.send_buffer = bytes()
 
     async def send(self, buf):
         self.send_buffer.write(buf)
         while len(self.send_buffer) > messages.Data.max_data_size:
-            block = self.send_buffer.read(messages.Data.max_data_size)
+            block = self.send_buffer[0 : messages.Data.max_data_size]
+            self.send_buffer = self.send_buffer[messages.Data.max_data_size :]
             await self._send_block(block)
 
     async def _send_block(self, buf):
@@ -98,7 +75,9 @@ class TFTPBufferedDataSender:
     async def close(self):
         # Send the last of the bits inside the send buffer, or an empty data
         # packet if the buffer is empty.
-        await self._send_block(self.send_buffer.readall())
+        await self._send_block(self.send_buffer)
+        self.send_buffer = bytes()
+
         await self.proto.close()
 
 
@@ -144,16 +123,6 @@ class TFTPDataReceiver:
         await self.proto.close()
 
 
-def bytegroups(iterable, size):
-    it = iter(iterable)
-    while True:
-        piece = bytes(itertools.islice(it, size))
-        if len(piece) > 0:
-            yield piece
-        else:
-            return
-
-
 @contextlib.asynccontextmanager
 async def aclosing(thing):
     yield thing
@@ -171,9 +140,6 @@ class TFTPTransferProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        # if addr != (self.addr, self.port):
-        #     # Random inbound packet not from our tftp peer
-        #     return
         if self.receiver is None or self.receiver.done():
             print(
                 "Error: Received a message, but no receiver is available.  Discarding."
